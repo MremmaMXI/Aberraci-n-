@@ -7,15 +7,12 @@
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-/* ── Layout base responsive ── */
 body {
   background: #fff; color: #111;
   font-family: 'Georgia', serif;
   overflow-x: hidden;
   padding-bottom: 40px;
 }
-
-/* PC: max 640px centrado; móvil portrait: full width */
 @media (min-width: 600px) {
   body { max-width: 640px; margin: 0 auto; }
 }
@@ -37,7 +34,6 @@ body {
 .obs-sub   { font-size: clamp(0.46rem, 1.4vw, 0.54rem); font-family: monospace; color: #888; display: block; margin-top: 1px; }
 .obs-btn.active .obs-sub { color: #aaa; }
 
-/* sub-menu flight mode */
 #flightMenu {
   display: none;
   border-bottom: 2px solid #111;
@@ -54,7 +50,6 @@ body {
 .fm-btn:last-child { border-right: none; }
 .fm-btn.active { background: #333; color: #fff; }
 
-/* zoom canvas */
 .zoom-vp {
   width: 100%; overflow: hidden; background: #000;
   border-bottom: 2px solid #111; position: relative;
@@ -69,7 +64,6 @@ canvas  { display: block; width: 100% !important; height: auto !important; }
   color: rgba(255,255,255,0.3); pointer-events: none;
 }
 
-/* status bars */
 .status-bar {
   display: flex; align-items: center; gap: 8px;
   padding: 6px 12px; background: #f5f5f5;
@@ -81,7 +75,6 @@ canvas  { display: block; width: 100% !important; height: auto !important; }
 .s-fill  { height: 100%; border-radius: 4px; transition: width .06s; }
 .s-val   { min-width: 48px; text-align: right; color: #333; }
 
-/* formula */
 .formula-panel {
   background: #f5f5f5; border-bottom: 1px solid #ddd;
   padding: 7px 12px; font-family: monospace;
@@ -130,7 +123,6 @@ canvas  { display: block; width: 100% !important; height: auto !important; }
 }
 .note strong { font-size: clamp(0.53rem,1.6vw,.62rem); }
 
-/* Landscape móvil */
 @media (max-width: 900px) and (orientation: landscape) {
   body { max-width: 100%; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto; }
   .header       { grid-column: 1 / -1; }
@@ -166,7 +158,6 @@ canvas  { display: block; width: 100% !important; height: auto !important; }
   </button>
 </div>
 
-<!-- FLIGHT MODE SUB-MENU (visible only in ship view) -->
 <div id="flightMenu">
   <button class="fm-btn" id="fm0" onclick="setFlight(0)">
     🔥 Motores a tope<br><small style="font-size:0.5rem;opacity:.7">(Estacionario sobre Rs)</small>
@@ -296,205 +287,276 @@ for(let i=0;i<200;i++){STARS.push({
 ══════════════════════════════════════ */
 let obsMode=0, flightMode=1;
 let running=true, raf=null, tick=0;
-let photons=[];
 
 /* ══════════════════════════════════════
    PERSPECTIVE 0 — EXTERNAL OBSERVER
    ─────────────────────────────────────
-   CYCLE = 620 ticks total (≈10s @ 60fps)
-   Phase 1  [0 , 0.55) → approach + expo-4 braking
-   Phase 2  [0.55, 0.80) → frozen at horizon, full opacity (≈25% of cycle = ~5s)
-   Phase 3  [0.80, 1.00] → linear fade-out to opacity 0
-   No particle balls — only the rocket ship + trail.
-══════════════════════════════════════ */
-const CYCLE=620;
-const P1_END=0.55, P2_END=0.80;
+   TIMING  (@ ~60 fps)
+   CYCLE = 1260 ticks  ≈ 21 s total
 
-/* Map progress p→rNorm using expo-4 brake (only valid in phase 1) */
+   Phase 1  p ∈ [0,    0.45)  →  approach: the ship travels at normal speed,
+                                  then brakes hard using a power-6 curve.
+                                  Covers 45% of the cycle (~9 s).
+
+   Phase 2  p ∈ [0.45, 0.78)  →  FROZEN at horizon: solid red, 100% opacity.
+                                  Covers 33% of the cycle (~7 s).
+
+   Phase 3  p ∈ [0.78, 1.00]  →  GHOST: stays red, opacity fades 1→0 linearly.
+                                  Covers 22% of the cycle (~4.5 s).
+
+   NO particle balls / photon orbs emitted. Only ship + trail.
+══════════════════════════════════════ */
+
+/* Total cycle length in frames */
+const CYCLE = 1260;
+
+/* Phase boundary fractions */
+const P1_END = 0.45;   // end of approach/braking
+const P2_END = 0.78;   // end of frozen (start of fade)
+
+/*
+  shipRnorm(p)  →  normalised radial distance above Rs.
+  Returns 1.0 when the ship is far away (beginning) and
+  0.0001 when it has effectively reached the horizon.
+
+  Curve design:
+    • t  = p / P1_END   runs 0→1 during phase 1
+    • We use  1 - t^6   so the ship moves fast at the start
+      (large steps in rNorm) and crawls to nearly zero near the end.
+    • The exponent 6 makes the deceleration far more aggressive
+      than the previous power-4 version.
+*/
 function shipRnorm(p){
-  if(p>=P1_END) return 0.0002;
-  const t=p/P1_END;            // 0→1 over phase 1
-  return Math.max(0.0002, 1-Math.pow(t,4)*0.9998);
+  if(p >= P1_END) return 0.0001;          // frozen at horizon
+  const t = p / P1_END;                   // 0 → 1 during approach
+  return Math.max(0.0001, 1 - Math.pow(t, 6) * 0.9999);
 }
 
 function renderExternal(){
-  const p=clamp(tick/CYCLE,0,1);
-  const phase= p<P1_END ? 1 : p<P2_END ? 2 : 3;
-  const rNorm=shipRnorm(p);
-  const Rs=72;
-  const bhCX=W*0.60, bhCY=H/2;
-  const r=Rs*(1+rNorm*5.0);
-  const rfVal=rfactor(r,Rs);
-  const apparentVel=clamp(rfVal*0.97,0,1);
+  const p = clamp(tick / CYCLE, 0, 1);
 
-  /* Ship alpha: 1.0 in phase 1&2, linear fade in phase 3 */
-  const fadeAlpha = phase<3 ? 1.0 : clamp(1-(p-P2_END)/(1.0-P2_END),0,1);
+  /* ── phase ── */
+  const phase = p < P1_END ? 1 : p < P2_END ? 2 : 3;
+
+  const rNorm  = shipRnorm(p);
+  const Rs     = 72;
+  const bhCX   = W * 0.60;
+  const bhCY   = H / 2;
+  const r      = Rs * (1 + rNorm * 5.0);       // actual pixel distance from BH centre
+  const rfVal  = rfactor(r, Rs);               // gravitational redshift factor (0→1)
+
+  /* apparent velocity shown in the HUD — zero when frozen */
+  const apparentVel = phase === 1 ? clamp(rfVal * 0.97, 0, 1) : 0;
+
+  /* ── alpha ──
+     Phase 1: full opacity
+     Phase 2: full opacity (frozen, deep red)
+     Phase 3: linear fade from 1 → 0                               */
+  const fadeAlpha = phase < 3
+    ? 1.0
+    : clamp(1 - (p - P2_END) / (1.0 - P2_END), 0, 1);
+
+  /* The colour to render the ship.
+     Phase 1: follows rfVal naturally (white-blue → yellow → orange → red).
+     Phase 2 & 3: force a deep infrared-red that stays constant.           */
+  const drawRf = (phase === 1) ? rfVal : 0.03;
 
   /* ── BACKGROUND ── */
-  ctx.fillStyle='#040408'; ctx.fillRect(0,0,W,H);
-  STARS.forEach(s=>{
-    s.twinkle+=0.012;
-    const a=0.3+0.2*Math.sin(s.twinkle);
-    ctx.fillStyle=`rgba(255,255,255,${a})`;
-    ctx.beginPath();ctx.arc(s.x,s.y,s.r,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle = '#040408';
+  ctx.fillRect(0, 0, W, H);
+
+  STARS.forEach(s => {
+    s.twinkle += 0.012;
+    const a = 0.3 + 0.2 * Math.sin(s.twinkle);
+    ctx.fillStyle = `rgba(255,255,255,${a})`;
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI*2); ctx.fill();
   });
 
   /* ── ACCRETION DISK ── */
-  for(let i=4;i>=0;i--){
-    const ri=Rs*(1.15+i*0.28);
-    const al=[0.22,0.16,0.11,0.07,0.03][i];
-    const hue=[28,20,14,8,4][i];
-    const g=ctx.createRadialGradient(bhCX,bhCY,ri-Rs*0.1,bhCX,bhCY,ri+Rs*0.3);
-    g.addColorStop(0,`hsla(${hue},95%,55%,0)`);
-    g.addColorStop(0.4,`hsla(${hue},95%,55%,${al})`);
-    g.addColorStop(1,`hsla(${hue},95%,28%,0)`);
-    ctx.fillStyle=g;ctx.beginPath();ctx.arc(bhCX,bhCY,ri+Rs*0.3,0,Math.PI*2);ctx.fill();
+  for(let i = 4; i >= 0; i--){
+    const ri  = Rs * (1.15 + i * 0.28);
+    const al  = [0.22, 0.16, 0.11, 0.07, 0.03][i];
+    const hue = [28, 20, 14, 8, 4][i];
+    const g   = ctx.createRadialGradient(bhCX, bhCY, ri - Rs*0.1, bhCX, bhCY, ri + Rs*0.3);
+    g.addColorStop(0,   `hsla(${hue},95%,55%,0)`);
+    g.addColorStop(0.4, `hsla(${hue},95%,55%,${al})`);
+    g.addColorStop(1,   `hsla(${hue},95%,28%,0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(bhCX, bhCY, ri + Rs*0.3, 0, Math.PI*2); ctx.fill();
   }
 
   /* ── BLACK HOLE ── */
-  const gBH=ctx.createRadialGradient(bhCX,bhCY,Rs*0.9,bhCX,bhCY,Rs*2.5);
-  gBH.addColorStop(0,'rgba(0,0,0,1)');gBH.addColorStop(0.55,'rgba(0,0,0,0.7)');gBH.addColorStop(1,'rgba(0,0,0,0)');
-  ctx.fillStyle=gBH;ctx.beginPath();ctx.arc(bhCX,bhCY,Rs*2.5,0,Math.PI*2);ctx.fill();
-  ctx.fillStyle='#000';ctx.beginPath();ctx.arc(bhCX,bhCY,Rs,0,Math.PI*2);ctx.fill();
-  ctx.strokeStyle='rgba(255,200,60,0.22)';ctx.lineWidth=1.5;ctx.setLineDash([3,5]);
-  ctx.beginPath();ctx.arc(bhCX,bhCY,Rs*1.5,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);
-  ctx.strokeStyle='rgba(220,50,50,0.65)';ctx.lineWidth=2;
-  ctx.beginPath();ctx.arc(bhCX,bhCY,Rs,0,Math.PI*2);ctx.stroke();
+  const gBH = ctx.createRadialGradient(bhCX, bhCY, Rs*0.9, bhCX, bhCY, Rs*2.5);
+  gBH.addColorStop(0,    'rgba(0,0,0,1)');
+  gBH.addColorStop(0.55, 'rgba(0,0,0,0.7)');
+  gBH.addColorStop(1,    'rgba(0,0,0,0)');
+  ctx.fillStyle = gBH;
+  ctx.beginPath(); ctx.arc(bhCX, bhCY, Rs*2.5, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(bhCX, bhCY, Rs, 0, Math.PI*2); ctx.fill();
 
-  /* ── SHIP TRAIL (same expo-4 curve, no particle balls) ── */
-  const trailLen=32;
-  for(let i=1;i<=trailLen;i++){const tp=Math.max(0, p - i*0.006);const tRnorm=shipRnorm(tp);const tr=Rs*(1+tRnorm*5.0);
-    const tx=bhCX-tr, ty=bhCY;
-    if(tx < bhCX-Rs*0.98){
-      const trfV=rfactor(tr,Rs);
-      // trail alpha also respects fadeAlpha so it vanishes with the ship
-      const trailAlpha=clamp(trfV*0.42*(1-i/trailLen)*fadeAlpha,0,0.36);
-      ctx.fillStyle=rfToColor(trfV,trailAlpha);
-      ctx.beginPath();ctx.arc(tx,ty,1.8,0,Math.PI*2);ctx.fill();
+  /* photon-sphere ring */
+  ctx.strokeStyle = 'rgba(255,200,60,0.22)'; ctx.lineWidth = 1.5;
+  ctx.setLineDash([3, 5]);
+  ctx.beginPath(); ctx.arc(bhCX, bhCY, Rs*1.5, 0, Math.PI*2); ctx.stroke();
+  ctx.setLineDash([]);
+
+  /* Schwarzschild-radius red ring */
+  ctx.strokeStyle = 'rgba(220,50,50,0.65)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(bhCX, bhCY, Rs, 0, Math.PI*2); ctx.stroke();
+
+  /* ── TRAIL ──
+     Each trail dot is placed at the ship's PAST position using the same
+     shipRnorm() function, so the trail matches the ship's exact braking curve.
+     No particle balls, no independent physics — just echoes of the ship.      */
+  const trailLen = 38;
+  for(let i = 1; i <= trailLen; i++){
+    const tp      = Math.max(0, p - i * 0.005);
+    const tRnorm  = shipRnorm(tp);
+    const tr      = Rs * (1 + tRnorm * 5.0);
+    const tx      = bhCX - tr;
+    const ty      = bhCY;
+
+    if(tx < bhCX - Rs * 0.98){
+      const trfV       = (phase === 1) ? rfactor(tr, Rs) : 0.03;
+      const trailAlpha = clamp(trfV * 0.40 * (1 - i / trailLen) * fadeAlpha, 0, 0.34);
+      if(trailAlpha > 0.005){
+        ctx.fillStyle = rfToColor(trfV, trailAlpha);
+        ctx.beginPath(); ctx.arc(tx, ty, 1.6, 0, Math.PI*2); ctx.fill();
+      }
     }
   }
 
-  /* ── DRAW SHIP ── */
-  const shipX=bhCX-r, shipY=bhCY;
+  /* ── SHIP ── */
+  const shipX = bhCX - r;
+  const shipY = bhCY;
 
-  // Phase 2: use pure red/infrared (rfVal ≈ 0, so we force IR color)
-  const drawRf = phase===2 ? 0.04 : rfVal;
+  if(fadeAlpha > 0.005 && shipX < bhCX - Rs * 0.97){
 
-  if(fadeAlpha>0.01 && shipX < bhCX-Rs*0.97){
-    // engine glow
-    const eg=ctx.createRadialGradient(shipX-16,shipY,0,shipX-16,shipY,18);
-    eg.addColorStop(0,rfToColor(drawRf,fadeAlpha*0.65));eg.addColorStop(1,'transparent');
-    ctx.fillStyle=eg;ctx.beginPath();ctx.arc(shipX-16,shipY,18,0,Math.PI*2);ctx.fill();
-    // halo
-    const hg=ctx.createRadialGradient(shipX,shipY,0,shipX,shipY,24);
-    hg.addColorStop(0,rfToColor(drawRf,fadeAlpha*0.3));hg.addColorStop(1,'transparent');
-    ctx.fillStyle=hg;ctx.beginPath();ctx.arc(shipX,shipY,24,0,Math.PI*2);ctx.fill();
-    // body
-    ctx.fillStyle=rfToColor(drawRf,fadeAlpha);
-    ctx.strokeStyle=rfToColor(Math.min(drawRf+0.1,1),fadeAlpha*0.6);ctx.lineWidth=1;
+    /* engine glow */
+    const eg = ctx.createRadialGradient(shipX-16, shipY, 0, shipX-16, shipY, 18);
+    eg.addColorStop(0, rfToColor(drawRf, fadeAlpha * 0.65));
+    eg.addColorStop(1, 'transparent');
+    ctx.fillStyle = eg;
+    ctx.beginPath(); ctx.arc(shipX-16, shipY, 18, 0, Math.PI*2); ctx.fill();
+
+    /* halo */
+    const hg = ctx.createRadialGradient(shipX, shipY, 0, shipX, shipY, 24);
+    hg.addColorStop(0, rfToColor(drawRf, fadeAlpha * 0.28));
+    hg.addColorStop(1, 'transparent');
+    ctx.fillStyle = hg;
+    ctx.beginPath(); ctx.arc(shipX, shipY, 24, 0, Math.PI*2); ctx.fill();
+
+    /* body */
+    ctx.fillStyle   = rfToColor(drawRf, fadeAlpha);
+    ctx.strokeStyle = rfToColor(Math.min(drawRf + 0.08, 1), fadeAlpha * 0.55);
+    ctx.lineWidth   = 1;
     ctx.beginPath();
-    ctx.moveTo(shipX+14,shipY);ctx.lineTo(shipX-5,shipY-7);
-    ctx.lineTo(shipX-12,shipY);ctx.lineTo(shipX-5,shipY+7);
-    ctx.closePath();ctx.fill();ctx.stroke();
-    // porthole
-    if(drawRf>0.08){
-      ctx.fillStyle=rfToColor(drawRf,fadeAlpha*0.5);
-      ctx.beginPath();ctx.arc(shipX+2,shipY,3.5,0,Math.PI*2);ctx.fill();
-    }
-    /* wavelength label (only phase 1) */
-    if(phase===1 && rfVal>0.04){
-      const nm=Math.round(rfToNm(rfVal));
-      ctx.fillStyle=rfToColor(rfVal,Math.min(1,fadeAlpha*1.5));
-      ctx.font='7px monospace';ctx.textAlign='center';
-      ctx.fillText(`λ≈${nm}nm`,shipX,shipY-20);
-    }
-    /* PHASE 2: FROZEN label */
-    if(phase===2){
-      ctx.fillStyle='rgba(220,55,40,0.95)';
-      ctx.font='bold 8px monospace';ctx.textAlign='center';
-      ctx.fillText('CONGELADO EN Rs',shipX,shipY-33);
-      ctx.fillStyle='rgba(200,200,200,0.8)';ctx.font='6.5px monospace';
-      ctx.fillText('t_coord → ∞',shipX,shipY-22);
-      ctx.fillText('τ_nave continúa...',shipX,shipY-12);
-    }
-    /* PHASE 3: fading ghost label */
-    if(phase===3 && fadeAlpha>0.05){
-      ctx.fillStyle=`rgba(220,55,40,${fadeAlpha*0.85})`;
-      ctx.font='bold 7px monospace';ctx.textAlign='center';
-      ctx.fillText('DESVANECIENDO...',shipX,shipY-22);
-    }
-  }
+    ctx.moveTo(shipX + 14, shipY);
+    ctx.lineTo(shipX -  5, shipY - 7);
+    ctx.lineTo(shipX - 12, shipY);
+    ctx.lineTo(shipX -  5, shipY + 7);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
 
-  /* ── PHOTON PULSES (only phase 1 & 2) ── */
-  if(running && rfVal>0.02 && phase<3){
-    const rate=Math.max(4,Math.round(36*rfVal));
-    if(tick%rate===0){
-      photons.push({
-        x:shipX, y:shipY+lerp(-3,3,Math.random()),
-        vx:1.5+rfVal*0.9,
-        nm:rfToNm(drawRf),
-        alpha:Math.min(1,rfVal*1.7),
-        life:Math.ceil((W-shipX)/2.1)+5
-      });
+    /* porthole — only visible while ship has colour */
+    if(drawRf > 0.06){
+      ctx.fillStyle = rfToColor(drawRf, fadeAlpha * 0.45);
+      ctx.beginPath(); ctx.arc(shipX + 2, shipY, 3.5, 0, Math.PI*2); ctx.fill();
     }
-  }
-  for(let i=photons.length-1;i>=0;i--){
-    const ph=photons[i];ph.x+=ph.vx;ph.life--;
-    const a=ph.alpha*(ph.life/(ph.life+5))*0.85;
-    if(ph.nm>750){
-      const d=clamp((ph.nm-750)/170,0,1);
-      ctx.fillStyle=`rgba(${Math.round(lerp(170,0,d))},0,0,${a*lerp(1,0.08,d)})`;
-    }else{
-      const [r2,g2,b2]=wl2rgb(ph.nm);
-      ctx.fillStyle=`rgba(${r2},${g2},${b2},${a})`;
+
+    /* wavelength label — only during approach (phase 1) */
+    if(phase === 1 && rfVal > 0.05 && fadeAlpha > 0.15){
+      const nm = Math.round(rfToNm(rfVal));
+      ctx.fillStyle  = rfToColor(rfVal, Math.min(1, fadeAlpha * 1.4));
+      ctx.font       = '7px monospace';
+      ctx.textAlign  = 'center';
+      ctx.fillText(`λ≈${nm}nm`, shipX, shipY - 20);
     }
-    ctx.beginPath();ctx.arc(ph.x,ph.y,1.5,0,Math.PI*2);ctx.fill();
-    if(ph.life<=0||ph.x>W+10) photons.splice(i,1);
+
+    /* PHASE 2 label — solid red text, no fade */
+    if(phase === 2){
+      ctx.fillStyle = 'rgba(220,55,40,0.95)';
+      ctx.font      = 'bold 8px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('CONGELADO EN Rs', shipX, shipY - 33);
+      ctx.fillStyle = 'rgba(200,200,200,0.8)';
+      ctx.font      = '6.5px monospace';
+      ctx.fillText('t_coord → ∞',      shipX, shipY - 22);
+      ctx.fillText('τ_nave continúa…', shipX, shipY - 12);
+    }
+
+    /* PHASE 3 label — fades with ship */
+    if(phase === 3 && fadeAlpha > 0.05){
+      ctx.fillStyle = `rgba(220,55,40,${fadeAlpha * 0.85})`;
+      ctx.font      = 'bold 7px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('DESVANECIENDO…', shipX, shipY - 22);
+    }
   }
 
   /* ── OBSERVER ICON ── */
-  const obsX=W-22,obsY=H/2;
-  ctx.fillStyle='rgba(255,255,255,0.12)';ctx.beginPath();ctx.arc(obsX,obsY,14,0,Math.PI*2);ctx.fill();
-  ctx.font='18px serif';ctx.textAlign='center';ctx.fillText('👁',obsX,obsY+6);
-  ctx.fillStyle='rgba(255,255,255,0.45)';ctx.font='6px monospace';ctx.textAlign='center';ctx.fillText('LEJANO',obsX,obsY-18);
+  const obsX = W - 22, obsY = H / 2;
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.beginPath(); ctx.arc(obsX, obsY, 14, 0, Math.PI*2); ctx.fill();
+  ctx.font = '18px serif'; ctx.textAlign = 'center';
+  ctx.fillText('👁', obsX, obsY + 6);
+  ctx.fillStyle = 'rgba(255,255,255,0.45)';
+  ctx.font = '6px monospace';
+  ctx.fillText('LEJANO', obsX, obsY - 18);
 
   /* ── SPECTRUM STRIP ── */
-  const bx=10,by=H-28,bw=W-20,bh=9;
-  const sg=ctx.createLinearGradient(bx,0,bx+bw,0);
-  sg.addColorStop(0,'rgba(80,80,255,0.85)');sg.addColorStop(0.18,'rgba(100,200,255,0.85)');
-  sg.addColorStop(0.36,'rgba(255,255,255,0.85)');sg.addColorStop(0.54,'rgba(255,220,60,0.85)');
-  sg.addColorStop(0.72,'rgba(255,80,20,0.85)');sg.addColorStop(0.88,'rgba(140,0,0,0.85)');
-  sg.addColorStop(1,'rgba(10,0,0,0.7)');
-  ctx.fillStyle=sg;ctx.fillRect(bx,by,bw,bh);
-  ctx.strokeStyle='rgba(255,255,255,0.18)';ctx.lineWidth=1;ctx.strokeRect(bx,by,bw,bh);
-  const ptr=bx+bw*clamp(1-drawRf*0.8,0,1);
-  ctx.fillStyle='rgba(255,255,255,0.9)';ctx.fillRect(ptr-1,by-3,2,bh+6);
-  ctx.fillStyle='rgba(180,180,180,0.55)';ctx.font='6px monospace';
-  ctx.textAlign='left';ctx.fillText('← Azul',bx+2,by-5);
-  ctx.textAlign='right';ctx.fillText('Rojo →',bx+bw-2,by-5);
-  ctx.textAlign='center';ctx.fillText('Espectro recibido (Doppler gravitacional)',W/2,by+bh+10);
+  const bx = 10, by = H - 28, bw = W - 20, bh = 9;
+  const sg = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+  sg.addColorStop(0,    'rgba(80,80,255,0.85)');
+  sg.addColorStop(0.18, 'rgba(100,200,255,0.85)');
+  sg.addColorStop(0.36, 'rgba(255,255,255,0.85)');
+  sg.addColorStop(0.54, 'rgba(255,220,60,0.85)');
+  sg.addColorStop(0.72, 'rgba(255,80,20,0.85)');
+  sg.addColorStop(0.88, 'rgba(140,0,0,0.85)');
+  sg.addColorStop(1,    'rgba(10,0,0,0.7)');
+  ctx.fillStyle = sg;   ctx.fillRect(bx, by, bw, bh);
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 1;
+  ctx.strokeRect(bx, by, bw, bh);
+
+  const ptr = bx + bw * clamp(1 - drawRf * 0.8, 0, 1);
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.fillRect(ptr - 1, by - 3, 2, bh + 6);
+
+  ctx.fillStyle = 'rgba(180,180,180,0.55)'; ctx.font = '6px monospace';
+  ctx.textAlign = 'left';   ctx.fillText('← Azul',    bx + 2,      by - 5);
+  ctx.textAlign = 'right';  ctx.fillText('Rojo →',    bx + bw - 2, by - 5);
+  ctx.textAlign = 'center'; ctx.fillText('Espectro recibido (Doppler gravitacional)', W/2, by + bh + 10);
 
   /* horizon dashed line */
-  ctx.strokeStyle='rgba(220,50,50,0.35)';ctx.lineWidth=1;ctx.setLineDash([3,4]);
-  ctx.beginPath();ctx.moveTo(bhCX,18);ctx.lineTo(bhCX,H-40);ctx.stroke();ctx.setLineDash([]);
-  ctx.fillStyle='rgba(220,50,50,0.55)';ctx.font='6px monospace';ctx.textAlign='center';ctx.fillText('Rs',bhCX,14);
+  ctx.strokeStyle = 'rgba(220,50,50,0.35)'; ctx.lineWidth = 1;
+  ctx.setLineDash([3, 4]);
+  ctx.beginPath(); ctx.moveTo(bhCX, 18); ctx.lineTo(bhCX, H - 40); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = 'rgba(220,50,50,0.55)';
+  ctx.font = '6px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('Rs', bhCX, 14);
 
-  /* HUD */
-  const nmHud=Math.round(rfToNm(drawRf));
-  document.getElementById('sl1').textContent='Vel. aparente:';
-  document.getElementById('sf1').style.width=(apparentVel*100).toFixed(1)+'%';
-  document.getElementById('sf1').style.background=rfToColor(rfVal+0.1,1).replace(/,[\d.]+\)$/,')').replace('rgba','rgb');
-  document.getElementById('sv1').textContent=(apparentVel*0.98).toFixed(2)+'c';
-  document.getElementById('sl2').textContent='Longitud onda:';
-  document.getElementById('sf2').style.width=(clamp(1-drawRf,0,1)*100).toFixed(0)+'%';
-  document.getElementById('sf2').style.background=rfToColor(drawRf,1).replace(/,[\d.]+\)$/,')').replace('rgba','rgb');
-  document.getElementById('sv2').textContent=nmHud+'nm';
+  /* ── HUD ── */
+  const nmHud = Math.round(rfToNm(drawRf));
+  document.getElementById('sl1').textContent = 'Vel. aparente:';
+  document.getElementById('sf1').style.width      = (apparentVel * 100).toFixed(1) + '%';
+  document.getElementById('sf1').style.background = rfToColor(Math.max(drawRf, 0.1), 1)
+      .replace(/,[\d.]+\)$/, ')').replace('rgba', 'rgb');
+  document.getElementById('sv1').textContent = phase === 1
+      ? (apparentVel * 0.98).toFixed(2) + 'c'
+      : '0.00c';
+  document.getElementById('sl2').textContent = 'Longitud onda:';
+  document.getElementById('sf2').style.width      = (clamp(1 - drawRf, 0, 1) * 100).toFixed(0) + '%';
+  document.getElementById('sf2').style.background = rfToColor(drawRf, 1)
+      .replace(/,[\d.]+\)$/, ')').replace('rgba', 'rgb');
+  document.getElementById('sv2').textContent = nmHud + 'nm';
 }
 
 /* ══════════════════════════════════════
    PERSPECTIVE 1 — SHIP VIEW
-   flightMode 0 = stationary (engines on, hover at r ≈ 1.18·Rs)
-   flightMode 1 = freefall (inertial, v→c)
+   flightMode 0 = stationary (engines on)
+   flightMode 1 = freefall  (inertial)
 ══════════════════════════════════════ */
 
 function drawBHCore(bx,by,Rs,shadowR){
@@ -502,12 +564,11 @@ function drawBHCore(bx,by,Rs,shadowR){
     const ri=Rs*(1.15+i*0.28),al=[0.28,0.20,0.13,0.08,0.04][i],hue=[28,20,14,8,4][i];
     const g=ctx.createRadialGradient(bx,by,ri-Rs*0.1,bx,by,ri+Rs*0.3);
     g.addColorStop(0,`hsla(${hue},95%,60%,0)`);
-    g.addColorStop(0.4,`hsla(${hue},95%,55%,${al})`);
-    g.addColorStop(1,`hsla(${hue},95%,30%,0)`);
+    g.addColorStop(0.4,`hsla(${hue},95%,55%,${al});
     ctx.fillStyle=g;ctx.beginPath();ctx.arc(bx,by,ri+Rs*0.3,0,Math.PI*2);ctx.fill();
   }
   const sh=ctx.createRadialGradient(bx,by,shadowR*0.5,bx,by,shadowR);
-  sh.addColorStop(0,'rgba(0,0,0,1)');sh.addColorStop(0.7,'rgba(0,0,0,0.92)');sh.addColorStop(1,'rgba(0,0,0,0)');
+  sh.addColorStop(0,'rgba(0,0,0,1)');sh.addColorStop(0.7,'rgba(0,0,0,0.92)');sh.addColorStop(1,'rgba(0,0,0,0);');
   ctx.fillStyle=sh;ctx.beginPath();ctx.arc(bx,by,shadowR,0,Math.PI*2);ctx.fill();
   ctx.fillStyle='#000';ctx.beginPath();ctx.arc(bx,by,Rs,0,Math.PI*2);ctx.fill();
 }
@@ -517,13 +578,11 @@ function renderShipStationary(){
   const bhCX=W/2,bhCY=H/2;
   const Rs=60;
   const r_stat=Rs*1.18;
-  const rfStat=rfactor(r_stat,Rs);   // ≈ 0.395
-  const blueBoost=1/Math.max(rfStat,0.01);  // ≈ 2.5×
+  const rfStat=rfactor(r_stat,Rs);
+  const blueBoost=1/Math.max(rfStat,0.01);
 
-  /* BG: deep blue-UV */
   ctx.fillStyle='rgb(0,2,14)';ctx.fillRect(0,0,W,H);
 
-  /* STARS: gravitational lensing + blueshift, v=0 so NO aberration */
   STARS.forEach(s=>{
     s.twinkle+=0.014;
     const dx=s.baseX-bhCX,dy=s.baseY-bhCY;
@@ -536,11 +595,10 @@ function renderShipStationary(){
     if(boostedNm<395){sc_r=120;sc_g=0;sc_b=200;}
     else{[sc_r,sc_g,sc_b]=wl2rgb(boostedNm);}
     const bright=clamp(0.4+0.3*Math.sin(s.twinkle)+lensDeflect*0.4,0,1);
-    ctx.fillStyle=`rgba(${sc_r},${sc_g},${sc_b},${bright})`;
+    ctx.fillStyle=`rgba(${sc_r},${sc_g},${sc_b},${bright});
     ctx.beginPath();ctx.arc(sx,sy,s.r*(1+lensDeflect*0.8),0,Math.PI*2);ctx.fill();
   });
 
-  // Einstein ring
   const ringPulse=1+0.04*Math.sin(tick*0.04);
   ctx.strokeStyle='rgba(180,160,255,0.55)';ctx.lineWidth=2.5;
   ctx.beginPath();ctx.arc(bhCX,bhCY,Rs*1.7*ringPulse,0,Math.PI*2);ctx.stroke();
@@ -549,19 +607,16 @@ function renderShipStationary(){
 
   drawBHCore(bhCX,bhCY,Rs,Rs*2.8);
 
-  /* COCKPIT FRAME */
   ctx.strokeStyle='rgba(40,50,60,0.6)';ctx.lineWidth=4;
   const fr=14;
   [[fr,fr,fr+22,fr],[fr,fr,fr,fr+22],[W-fr,fr,W-fr-22,fr],[W-fr,fr,W-fr,fr+22],
    [fr,H-fr,fr+22,H-fr],[fr,H-fr,fr,H-fr-22],[W-fr,H-fr,W-fr-22,H-fr],[W-fr,H-fr,W-fr,H-fr-22]
   ].forEach(([x1,y1,x2,y2])=>{ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();});
 
-  /* EXTERNAL OBSERVER WINDOW — clock spins fast (gravitational time dilation) */
   const winW=124,winH=84,winX=12,winY=12;
   ctx.fillStyle='rgba(0,5,18,0.9)';ctx.fillRect(winX,winY,winW,winH);
   ctx.strokeStyle='rgba(180,160,255,0.7)';ctx.lineWidth=1.5;ctx.strokeRect(winX,winY,winW,winH);
-  ctx.fillStyle='rgba(200,185,255,0.9)';ctx.font='6.5px monospace';ctx.textAlign='center';
-  ctx.fillText('Observador Lejano',winX+winW/2,winY+11);
+  ctx.fillStyle='rgba(200,185,255,0.9)';ctx.font='6.5px monospace';ctx.textAlign='center';ctx.fillText('Observador Lejano',winX+winW/2,winY+11);
 
   const extClockMult=Math.max(1,Math.round(blueBoost));
   const extAngle=tick*0.06*extClockMult;
@@ -572,7 +627,6 @@ function renderShipStationary(){
   ctx.strokeStyle='rgba(180,160,255,0.6)';
   ctx.beginPath();ctx.moveTo(ccX,ccY);ctx.lineTo(ccX+Math.cos(extAngle*12-Math.PI/2)*5,ccY+Math.sin(extAngle*12-Math.PI/2)*5);ctx.stroke();
 
-  // fast external figure
   const extSpd2=tick*(0.08+0.18);
   const eX2=winX+82,eBaseY=winY+winH-14,bob2=4*Math.abs(Math.sin(extSpd2));
   const eC='rgba(200,185,255,0.95)';
@@ -587,89 +641,70 @@ function renderShipStationary(){
   ctx.fillStyle='rgba(200,185,255,0.85)';ctx.font='6px monospace';ctx.textAlign='center';
   ctx.fillText(`×${Math.min(extClockMult,99)} más rápido`,winX+winW/2,winY+winH-3);
 
-  /* OWN CLOCK (normal pace) */
   const scCX=W-28,scCY=H-34,ownA=tick*0.038;
   ctx.strokeStyle='rgba(255,255,200,0.4)';ctx.lineWidth=1;ctx.beginPath();ctx.arc(scCX,scCY,12,0,Math.PI*2);ctx.stroke();
   ctx.strokeStyle='rgba(255,255,200,0.8)';ctx.lineWidth=1.5;
   ctx.beginPath();ctx.moveTo(scCX,scCY);ctx.lineTo(scCX+Math.cos(ownA-Math.PI/2)*9,scCY+Math.sin(ownA-Math.PI/2)*9);ctx.stroke();
   ctx.fillStyle='rgba(255,255,200,0.55)';ctx.font='6px monospace';ctx.textAlign='center';ctx.fillText('τ nave',scCX,scCY+22);
 
-  /* BLUESHIFT info */
   const uvNm=Math.round(480/blueBoost);
   ctx.fillStyle='rgba(180,160,255,0.85)';ctx.font='7px monospace';ctx.textAlign='right';
   ctx.fillText(`Blueshift ×${blueBoost.toFixed(1)}  λ≈${uvNm}nm`,W-14,H-42);
   ctx.fillText('v = 0  (cohete encendido)',W-14,H-32);
 }
 
-/* ── FREEFALL (inertial, v→c, Doppler redshift dominates) ── */
+/* ── FREEFALL (inertial) ── */
 function renderShipFreefall(){
   const p=clamp(tick/CYCLE,0,1);
   const bhCX=W/2,bhCY=H/2;
   const Rs=60;
 
-  // Smooth cubic approach: rNorm goes 1→0 as p goes 0→1
   const rNorm=Math.max(0.001,1-Math.pow(p,2.5)*0.999);
   const r=Rs*(1+rNorm*4.5);
-  // v/c = √(Rs/r) — GR freefall speed
   const infallV=Math.sqrt(Math.min(1,Rs/r));
   const crossed=p>0.84;
 
-  /* BG: darkens and reddens — freefall Doppler is RED forward */
   const redPhase=clamp(infallV,0,1);
   const bgR=Math.round(lerp(2,18,redPhase)),bgG=Math.round(lerp(2,2,redPhase)),bgB=Math.round(lerp(8,2,redPhase));
   ctx.fillStyle=`rgb(${bgR},${bgG},${bgB})`;ctx.fillRect(0,0,W,H);
 
-  /* STARS: aberration (pushed to outer halo) + Doppler redshift
-     - In freefall, stars ahead compress to ring but are redshifted (v→c toward BH)
-     - Stars shift to red/infrared as v→c
-     - Stars flee toward the outer halo (visual aberration)
-  */
   STARS.forEach(s=>{
     s.twinkle+=0.010;
     const dx=s.baseX-bhCX,dy=s.baseY-bhCY;
     const dist=Math.sqrt(dx*dx+dy*dy)||1;
     const nx=dx/dist,ny=dy/dist;
-    // aberration: push stars AWAY from BH center (outer halo shrinks as v→c)
     const aber=clamp(infallV*infallV,0,0.98);
     const newDist=lerp(dist,dist+(W*0.5-dist)*0.85,aber);
     const sx=bhCX+nx*newDist,sy=bhCY+ny*newDist;
-    // redshift toward infrared
     const redNm=Math.min(800,s.nmBase*(1+redPhase*1.1));
     let sr,sg,sb;
     if(redNm>750){const d=clamp((redNm-750)/120,0,1);sr=Math.round(lerp(200,20,d));sg=0;sb=0;}
     else{[sr,sg,sb]=wl2rgb(redNm);}
-    // stars dim as sky darkens
     const bright=Math.max(0,0.35+0.2*Math.sin(s.twinkle)-redPhase*0.28)*clamp(newDist/180,0,1);
     if(sx>0&&sx<W&&sy>0&&sy<H&&bright>0.02){
-      ctx.fillStyle=`rgba(${sr},${sg},${sb},${bright})`;
+      ctx.fillStyle=`rgba(${sr},${sg},${sb},${bright});
       ctx.beginPath();ctx.arc(sx,sy,s.r,0,Math.PI*2);ctx.fill();
     }
   });
 
-  /* BH SHADOW GROWS as we approach */
   const shadowR=Math.min(Rs*(1.2+redPhase*2.8),W*0.7);
   drawBHCore(bhCX,bhCY,Rs,shadowR);
 
-  // photon sphere shimmer
   ctx.strokeStyle=`rgba(255,160,30,${0.3+redPhase*0.4})`;ctx.lineWidth=2+redPhase*3;
   ctx.beginPath();ctx.arc(bhCX,bhCY,Rs*1.18,0,Math.PI*2);ctx.stroke();
   ctx.strokeStyle='rgba(220,50,50,0.6)';ctx.lineWidth=2;
   ctx.beginPath();ctx.arc(bhCX,bhCY,Rs,0,Math.PI*2);ctx.stroke();
 
-  /* COCKPIT FRAME */
   ctx.strokeStyle='rgba(40,30,30,0.6)';ctx.lineWidth=4;
   const fr=14;
   [[fr,fr,fr+22,fr],[fr,fr,fr,fr+22],[W-fr,fr,W-fr-22,fr],[W-fr,fr,W-fr,fr+22],
    [fr,H-fr,fr+22,H-fr],[fr,H-fr,fr,H-fr-22],[W-fr,H-fr,W-fr-22,H-fr],[W-fr,H-fr,W-fr,H-fr-22]
   ].forEach(([x1,y1,x2,y2])=>{ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();});
 
-  /* EXTERNAL OBSERVER WINDOW — normal pace (no illusion of universe speeding up in freefall) */
   const winW=120,winH=72,winX=12,winY=12;
   ctx.fillStyle='rgba(10,2,2,0.88)';ctx.fillRect(winX,winY,winW,winH);
   ctx.strokeStyle='rgba(180,120,100,0.6)';ctx.lineWidth=1.5;ctx.strokeRect(winX,winY,winW,winH);
-  ctx.fillStyle='rgba(210,170,150,0.85)';ctx.font='6.5px monospace';ctx.textAlign='center';
-  ctx.fillText('Observador Lejano',winX+winW/2,winY+11);
-  // Normal pace — equivalence principle: no time dilation illusion locally
+  ctx.fillStyle='rgba(210,170,150,0.85)';ctx.font='6.5px monospace';ctx.textAlign='center';ctx.fillText('Observador Lejano',winX+winW/2,winY+11);
   const extSpd3=tick*0.055;
   const eX3=winX+winW/2,eBase3=winY+winH-14,bob3=4*Math.abs(Math.sin(extSpd3));
   const eC3='rgba(210,170,150,0.9)';
@@ -684,7 +719,6 @@ function renderShipFreefall(){
   ctx.fillStyle='rgba(210,170,150,0.7)';ctx.font='6px monospace';ctx.textAlign='center';
   ctx.fillText('Tiempo local normal',winX+winW/2,winY+winH-3);
 
-  /* CROSSING HORIZON overlay */
   if(crossed){
     const cp=clamp((p-0.84)/0.14,0,1);
     ctx.fillStyle=`rgba(30,0,0,${cp*0.7})`;ctx.fillRect(0,0,W,H);
@@ -692,15 +726,14 @@ function renderShipFreefall(){
       const ta=clamp((cp-0.25)/0.4,0,1);
       ctx.fillStyle=`rgba(180,60,40,${ta*0.88})`;ctx.font='bold 10px monospace';ctx.textAlign='center';
       ctx.fillText('HORIZONTE CRUZADO',W/2,H/2-14);
-      ctx.font='7.5px monospace';ctx.fillStyle=`rgba(200,180,170,${ta*0.8})`;
+      ctx.font='7.5px monospace';ctx.fillStyle=`rgba(200,180,170,${ta*0.8});
       ctx.fillText('τ propio: continúa normal',W/2,H/2+4);
       ctx.fillText('Sin sensación especial localmente',W/2,H/2+18);
-      ctx.fillStyle=`rgba(160,80,60,${ta*0.7})`;ctx.font='7px monospace';
+      ctx.fillStyle=`rgba(160,80,60,${ta*0.7});
       ctx.fillText('Singularidad en r = 0  (adelante)',W/2,H/2+34);
     }
   }
 
-  /* REDSHIFT + ABERRATION LABELS */
   if(redPhase>0.15){
     const rp=clamp((redPhase-0.15)/0.3,0,1);
     const redNm2=Math.round(lerp(580,820,redPhase));
@@ -710,12 +743,11 @@ function renderShipFreefall(){
     ctx.fillText(`v ≈ ${infallV.toFixed(3)}c`,W-14,H-24);
   }
 
-  /* SPECTRUM STRIP (moves toward red) */
   const bx=10,by=H-16,bw=W-20,bh=8;
   const stg2=ctx.createLinearGradient(bx,0,bx+bw,0);
   stg2.addColorStop(0,'rgba(80,80,255,0.5)');stg2.addColorStop(0.3,'rgba(255,255,255,0.7)');
-  stg2.addColorStop(0.55,'rgba(255,200,60,0.8)');stg2.addColorStop(0.75,'rgba(255,60,10,0.85)');
-  stg2.addColorStop(1,'rgba(20,0,0,0.75)');
+stg2.addColorStop(0.55,'rgba(255,200,60,0.8)');stg2.addColorStop(0.75,'rgba(255,60,10,0.85)');
+stg2.addColorStop(1,'rgba(20,0,0,0.75)');
   ctx.fillStyle=stg2;ctx.fillRect(bx,by,bw,bh);
   ctx.strokeStyle='rgba(255,255,255,0.12)';ctx.lineWidth=1;ctx.strokeRect(bx,by,bw,bh);
   const ptr2=bx+bw*clamp(0.3+redPhase*0.65,0,1);
@@ -723,14 +755,13 @@ function renderShipFreefall(){
   ctx.fillStyle='rgba(180,120,100,0.55)';ctx.font='6px monospace';ctx.textAlign='right';
   ctx.fillText('Rojo → IR →',bx+bw-2,by-5);
 
-  /* OWN CLOCK */
   const scCX=W-28,scCY=H-34,ownA2=tick*0.038;
   ctx.strokeStyle='rgba(255,220,200,0.35)';ctx.lineWidth=1;ctx.beginPath();ctx.arc(scCX,scCY,12,0,Math.PI*2);ctx.stroke();
   ctx.strokeStyle='rgba(255,220,200,0.7)';ctx.lineWidth=1.5;
   ctx.beginPath();ctx.moveTo(scCX,scCY);ctx.lineTo(scCX+Math.cos(ownA2-Math.PI/2)*9,scCY+Math.sin(ownA2-Math.PI/2)*9);ctx.stroke();
-  ctx.fillStyle='rgba(255,220,200,0.45)';ctx.font='6px monospace';ctx.textAlign='center';ctx.fillText('τ nave',scCX,scCY+22);
+  ctx.fillStyle='rgba(255,220,200,0.45)';ctx.font='6px monospace';ctx.textAlign='center';
+  ctx.fillText('τ nave',scCX,scCY+22);
 
-  /* HUD */
   document.getElementById('sl1').textContent='Vel. caída:';
   document.getElementById('sf1').style.width=(infallV*100).toFixed(1)+'%';
   document.getElementById('sf1').style.background=`rgba(${Math.round(200+redPhase*55)},${Math.round(80-redPhase*80)},${Math.round(40-redPhase*40)},1)`;
@@ -755,12 +786,12 @@ const TDATA=[
       {n:'Luminosidad:',    v:'<span class="b">L_obs=L_emit·(1−Rs/r)²  →  0</span>'},
     ],
     info:[
-      {t:'Fase 1 — Frenado exponencial',
-       b:'La nave desacelera según dr/dt ∝ (1−Rs/r). La curva es potencia-4: frenado suave al principio, dramático al final. El color pasa de blanco-azul → amarillo → naranja → rojo-IR.'},
-      {t:'Fase 2 — Congelamiento óptico',
-       b:'En t_coord → ∞ la nave queda frozen en Rs. Color infrarrojo puro (λ → ∞). Opacidad 100% estática. Para el observador lejano esto dura para siempre: nunca recibirá el fotón del "cruce".'},
-      {t:'Fase 3 — Desvanecimiento',
-       b:'La nave pierde luminosidad L_obs → 0. La opacidad baja linealmente de 100% a 0. La nave se hace fantasma y desaparece. El ciclo reinicia suavemente.'},
+      {t:'Fase 1 — Frenado suave → dramático',
+       b:'La nave entra a velocidad normal. La curva potencia-6 hace que desacelere muy gradualmente al principio y de forma dramática al acercarse al horizonte Rs. Color: blanco-azul → amarillo → naranja → rojo profundo.'},
+      {t:'Fase 2 — Congelada en Rs (~7 s)',
+       b:'En t_coord → ∞ la nave queda estática en el horizonte. Color rojo-infrarrojo puro, opacidad 100% fija. Para el observador lejano esto dura para siempre.'},
+      {t:'Fase 3 — Desvanecimiento rojizo',
+       b:'La nave permanece roja pero su opacidad baja linealmente de 100% a 0%. Se desvanece como un fantasma carmesí antes de que el ciclo se reinicie.'},
     ],
     legend:[
       {c:'#a8c8ff',l:'Blanco-azul (lejos, λ≈480nm)'},
@@ -773,7 +804,7 @@ const TDATA=[
     formulas:[
       {n:'Blueshift grav.:',v:'<span class="b">f_obs=f_emit/√(1−Rs/r)  (motores enc.)</span>'},
       {n:'Caída libre v:',  v:'<span class="r">v/c ≈ √(Rs/r)  (Schwarzschild ff)</span>'},
-      {n:'Aberración:',     v:'<span class="g">cosθ\'=(cosθ−v/c)/(1−v·cosθ/c)</span>'},
+      {n:'Aberración:',     v:'<span class="g">cosθ&apos;=(cosθ−v/c)/(1−v·cosθ/c)</span>'},
       {n:'Redshift ff:',    v:'<span class="r">f_ff = f_emit·√(1−Rs/r)/(1+v·cosθ/c)</span>'},
       {n:'Tiempo propio:',  v:'<span class="p">τ cruza Rs en tiempo FINITO</span>'},
     ],
@@ -793,13 +824,13 @@ const TDATA=[
 ];
 
 const NOTES=[
-  '<strong>¿Por qué no cruza?</strong> Para el observador lejano, t→∞ cuando r→Rs. La nave emite fotones cada vez más espaciados y rojos. Su luminosidad L→0. La nave <em>desaparece</em> antes de cruzar visualmente.',
+  '<strong>¿Por qué no cruza?</strong> Para el observador lejano, t→∞ cuando r→Rs. La nave frena, se vuelve roja, se congela en el horizonte y se desvanece. Nunca la verá cruzar.',
   '<strong>Motores enc.:</strong> Hovering cerca del horizonte implica blueshift extremo y aceleración del reloj externo. Gravedad pura, sin velocidad.<br><strong>Caída libre:</strong> El astronauta cruza Rs en tiempo propio finito, sin percibir nada especial. El Doppler cinemático domina: cielo se oscurece y enrojece.'
 ];
 
 function populatePanel(){
   const d=TDATA[obsMode];
-  let h='<div class="flabel">Fórmulas clave</div>';
+  let h='<div class="flabel">Fórmulas clave</div>'; 
   d.formulas.forEach(f=>{h+=`<div class="frow"><span class="fn">${f.n}</span><span class="fv">${f.v}</span></div>`;});
   document.getElementById('fPanel').innerHTML=h;
   let lh='';d.legend.forEach(l=>{lh+=`<div class="li"><div class="ld" style="background:${l.c}"></div>${l.l}</div>`;});
@@ -826,9 +857,9 @@ function frame(){
   }
   const p=clamp(tick/CYCLE,0,1);
   if(running){
-    const iIdx=p<0.35?0:p<0.70?1:2;
+    const iIdx=p<P1_END?0:p<P2_END?1:2;
     setInfo(Math.min(iIdx,TDATA[obsMode].info.length-1));
-    tick=(tick+1)%(CYCLE+60);
+    tick=(tick+1)%(CYCLE+1);
     raf=requestAnimationFrame(frame);
   }
 }
@@ -837,7 +868,7 @@ function frame(){
    CONTROLS
 ══════════════════════════════════════ */
 function setObs(i){
-  obsMode=i;tick=0;photons=[];
+  obsMode=i;tick=0;
   document.getElementById('ob0').classList.toggle('active',i===0);
   document.getElementById('ob1').classList.toggle('active',i===1);
   document.getElementById('flightMenu').classList.toggle('visible',i===1);
@@ -860,7 +891,7 @@ function doToggle(){
   if(running) frame();
 }
 function doReset(){
-  tick=0;photons=[];running=true;
+  tick=0;running=true;
   document.getElementById('btnPlay').textContent='⏸ Pausar';
   document.getElementById('btnPlay').classList.add('on');
   populatePanel();frame();
@@ -869,7 +900,7 @@ function doStep(){
   if(running){doToggle();return;}
   tick=Math.min(tick+Math.floor(CYCLE/7),CYCLE-1);
   const p=clamp(tick/CYCLE,0,1);
-  setInfo(p<0.35?0:p<0.70?1:2);
+  setInfo(p<P1_END?0:p<P2_END?1:2);
   frame();
 }
 
